@@ -31,25 +31,35 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/** \file
+ * Runtime and compile-time assert macros
+ */
+
 #ifndef SPDK_ASSERT_H
 #define SPDK_ASSERT_H
 
-#include <assert.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#define SPDK_CONCAT_(x, y) x##y
-#define SPDK_CONCAT(x, y) SPDK_CONCAT_(x, y)
+#include <assert.h>
 
 #ifdef static_assert
 #define SPDK_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
 #else
-/*
- * Fallback for older compilers that don't support static_assert
+/**
+ * Compatibility wrapper for static_assert.
  *
- * The array size will expand to 0 if the condition is true, or
- * -1 if the condition is false (causing compilation to fail).
+ * This won't actually enforce the condition when compiled with an environment that doesn't support
+ * C11 static_assert; it is only intended to allow end users with old compilers to build the package.
+ *
+ * Developers should use a recent compiler that provides static_assert.
  */
-#define SPDK_STATIC_ASSERT(cond, msg) \
-        typedef char SPDK_CONCAT(SPDK_STATIC_ASSERT_, __LINE__)[!!(cond) - 1]
+#define SPDK_STATIC_ASSERT(cond, msg)
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* SPDK_ASSERT_H */

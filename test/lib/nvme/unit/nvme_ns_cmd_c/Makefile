@@ -31,10 +31,9 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/../../../../..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../../..)
 
 TEST_FILE = nvme_ns_cmd_ut.c
 OTHER_FILES = nvme.c
 
 include $(SPDK_ROOT_DIR)/mk/nvme.unittest.mk
-

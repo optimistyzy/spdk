@@ -26,17 +26,15 @@ find . -iname "spdk-*.tar.gz" -delete
 git archive HEAD -9 --prefix=${pv}/ -o ${pv}.tar.gz
 
 tarball=$(ls -1 spdk-*.tar.gz)
-if [ $PWD != $out ]; then
-	mv $tarball $out/
-fi
 
 # Build from packaged source
 tmpdir=$(mktemp -d)
 echo "tmpdir=$tmpdir"
-tar -C "$tmpdir" -xf $out/$tarball
+tar -C "$tmpdir" -xf $tarball
 (
 	cd "$tmpdir"/spdk-*
-	time $MAKE ${MAKEFLAGS} DPDK_DIR=$DPDK_DIR CONFIG_DEBUG=n
+	./configure $config_params --disable-debug --enable-werror
+	time $MAKE ${MAKEFLAGS}
 )
 rm -rf "$tmpdir"
 

@@ -33,7 +33,69 @@
 
 #include "CUnit/Basic.h"
 
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+
 #include "ioat/ioat.c"
+
+void *
+spdk_zmalloc(size_t size, size_t align, uint64_t *phys_addr)
+{
+	return calloc(1, size);
+}
+
+void spdk_free(void *buf)
+{
+	free(buf);
+}
+
+uint64_t spdk_vtophys(void *buf)
+{
+	return (uint64_t)buf;
+}
+
+void spdk_delay_us(unsigned int us)
+{
+
+}
+
+int
+spdk_pci_ioat_enumerate(spdk_pci_enum_cb enum_cb, void *enum_ctx)
+{
+	return -1;
+}
+
+int
+spdk_pci_device_map_bar(struct spdk_pci_device *dev, uint32_t bar,
+			void **mapped_addr, uint64_t *phys_addr, uint64_t *size)
+{
+	*mapped_addr = NULL;
+	*phys_addr = 0;
+	*size = 0;
+	return 0;
+}
+
+int
+spdk_pci_device_unmap_bar(struct spdk_pci_device *dev, uint32_t bar, void *addr)
+{
+	return 0;
+}
+
+int
+spdk_pci_device_cfg_read32(struct spdk_pci_device *dev, uint32_t *value,
+			   uint32_t offset)
+{
+	*value = 0xFFFFFFFFu;
+	return 0;
+}
+
+int
+spdk_pci_device_cfg_write32(struct spdk_pci_device *dev, uint32_t value,
+			    uint32_t offset)
+{
+	return 0;
+}
 
 static void ioat_state_check(void)
 {

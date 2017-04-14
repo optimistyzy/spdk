@@ -1,19 +1,27 @@
 set -xe
 ulimit -c unlimited
 
-MAKECONFIG='CONFIG_DEBUG=y'
+export RUN_NIGHTLY=0
+
+config_params='--enable-debug --enable-werror'
+
+export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1:abort_on_error=1'
+
+# Override the default NRHUGE in scripts/setup.sh
+export NRHUGE=4096
 
 case `uname` in
 	FreeBSD)
-		DPDK_DIR=/usr/local/share/dpdk/x86_64-native-bsdapp-clang
+		config_params+=' --with-dpdk=/usr/local/share/dpdk/x86_64-native-bsdapp-clang'
 		MAKE=gmake
 		MAKEFLAGS=${MAKEFLAGS:--j$(sysctl -a | egrep -i 'hw.ncpu' | awk '{print $2}')}
 		;;
 	Linux)
-		DPDK_DIR=/usr/local/share/dpdk/x86_64-native-linuxapp-gcc
+		config_params+=' --with-dpdk=/usr/local/share/dpdk/x86_64-native-linuxapp-gcc'
 		MAKE=make
 		MAKEFLAGS=${MAKEFLAGS:--j$(nproc)}
-		MAKECONFIG="$MAKECONFIG CONFIG_COVERAGE=y"
+		config_params+=' --enable-coverage'
+		config_params+=' --enable-ubsan'
 		;;
 	*)
 		echo "Unknown OS in $0"
@@ -21,7 +29,19 @@ case `uname` in
 		;;
 esac
 
-MAKEFLAGS=${MAKEFLAGS:--j16}
+if [ -f /usr/include/infiniband/verbs.h ]; then
+	config_params+=' --with-rdma'
+fi
+
+if [ -d /usr/src/fio ]; then
+	config_params+=' --with-fio=/usr/src/fio'
+fi
+
+if [ -d /usr/include/rbd ] &&  [ -d /usr/include/rados ]; then
+	config_params+=' --with-rbd'
+fi
+
+export config_params
 
 if [ -z "$output_dir" ]; then
 	if [ -z "$rootdir" ] || [ ! -d "$rootdir/../output" ]; then
@@ -33,8 +53,7 @@ if [ -z "$output_dir" ]; then
 fi
 
 if hash valgrind &> /dev/null; then
-	# TODO: add --error-exitcode=2 when all Valgrind warnings are fixed
-	valgrind='valgrind --leak-check=full'
+	valgrind='valgrind --leak-check=full --error-exitcode=2'
 else
 	valgrind=''
 fi
@@ -62,11 +81,15 @@ function timing() {
 }
 
 function timing_enter() {
+	set +x
 	timing "enter" "$1"
+	set -x
 }
 
 function timing_exit() {
+	set +x
 	timing "exit" "$1"
+	set -x
 }
 
 function timing_finish() {
@@ -83,12 +106,12 @@ function timing_finish() {
 
 function process_core() {
 	ret=0
-	for core in $(find . -type f -name 'core*'); do
+	for core in $(find . -type f \( -name 'core*' -o -name '*.core' \)); do
 		exe=$(eu-readelf -n "$core" | grep psargs | sed "s/.*psargs: \([^ \'\" ]*\).*/\1/")
 		echo "exe for $core is $exe"
 		if [[ ! -z "$exe" ]]; then
 			if hash gdb; then
-				gdb -batch -ex "bt" $exe $core
+				gdb -batch -ex "bt full" $exe $core
 			fi
 			cp $exe $output_dir
 		fi
@@ -99,3 +122,113 @@ function process_core() {
 	return $ret
 }
 
+function waitforlisten() {
+	# $1 = process pid
+	# $2 = TCP port number
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		exit 1
+	fi
+
+	echo "Waiting for process to start up and listen on TCP port $2..."
+	# turn off trace for this loop
+	set +x
+	ret=1
+	while [ $ret -ne 0 ]; do
+		# if the process is no longer running, then exit the script
+		#  since it means the application crashed
+		if ! kill -s 0 $1; then
+			exit
+		fi
+		if netstat -an --tcp | grep -iw listen | grep -q $2; then
+			ret=0
+		fi
+	done
+	set -x
+}
+
+function killprocess() {
+	# $1 = process pid
+	if [ -z "$1" ]; then
+		exit 1
+	fi
+
+	echo "killing process with pid $1"
+	kill $1
+	wait $1
+}
+
+function iscsicleanup() {
+	echo "Cleaning up iSCSI connection"
+	iscsiadm -m node --logout || true
+	iscsiadm -m node -o delete || true
+}
+
+function stop_iscsi_service() {
+	if cat /etc/*-release | grep Ubuntu; then
+		service open-iscsi stop
+	else
+		service iscsid stop
+	fi
+}
+
+function start_iscsi_service() {
+	if cat /etc/*-release | grep Ubuntu; then
+		service open-iscsi start
+	else
+		service iscsid start
+	fi
+}
+
+function rbd_setup() {
+	export CEPH_DIR=/home/sys_sgsw/ceph/build
+
+	if [ -d $CEPH_DIR ]; then
+		export RBD_POOL=rbd
+		export RBD_NAME=foo
+		(cd $CEPH_DIR && ../src/vstart.sh -d -n -x -l)
+		/usr/local/bin/rbd create $RBD_NAME --size 1000
+	fi
+}
+
+function rbd_cleanup() {
+	if [ -d $CEPH_DIR ]; then
+		(cd $CEPH_DIR && ../src/stop.sh || true)
+	fi
+}
+
+function run_test() {
+	set +x
+	echo "************************************"
+	echo "START TEST $1"
+	echo "************************************"
+	set -x
+	time "$@"
+	set +x
+	echo "************************************"
+	echo "END TEST $1"
+	echo "************************************"
+	set -x
+}
+
+function print_backtrace() {
+	set +x
+	echo "========== Backtrace start: =========="
+	echo ""
+	for i in $(seq 1 $((${#FUNCNAME[@]} - 1))); do
+		local func="${FUNCNAME[$i]}"
+		local line_nr="${BASH_LINENO[$((i - 1))]}"
+		local src="${BASH_SOURCE[$i]/#$rootdir/.}"
+		echo "in $src:$line_nr -> $func()"
+		echo "     ..."
+		nl -w 4 -ba -nln $src | grep -B 5 -A 5 "^$line_nr" | \
+			sed "s/^/   /g" | sed "s/^   $line_nr /=> $line_nr /g"
+		echo "     ..."
+	done
+	echo ""
+	echo "========== Backtrace end =========="
+	set -x
+	return 0
+}
+
+set -o errtrace
+trap "trap - ERR; print_backtrace >&2" ERR

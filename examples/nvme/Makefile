@@ -31,10 +31,12 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/../..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += identify perf reserve
+DIRS-y += hello_world identify perf reserve nvme_manage arbitration hotplug
+
+DIRS-$(CONFIG_FIO_PLUGIN) += fio_plugin
 
 .PHONY: all clean $(DIRS-y)
 
