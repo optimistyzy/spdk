@@ -31,10 +31,15 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+-include $(SPDK_ROOT_DIR)/CONFIG.local
 include $(SPDK_ROOT_DIR)/CONFIG
 
+-include $(SPDK_ROOT_DIR)/mk/cc.mk
+
 C_OPT ?= -fno-omit-frame-pointer
+ifneq ($(V),1)
 Q ?= @
+endif
 S ?= $(notdir $(CURDIR))
 
 ifeq ($(MAKECMDGOALS),)
@@ -43,9 +48,20 @@ endif
 
 OS := $(shell uname)
 
-COMMON_CFLAGS = -g $(C_OPT) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wmissing-declarations -Wstrict-prototypes -Werror -fno-strict-aliasing -march=native -m64 -I$(SPDK_ROOT_DIR)/include
+COMMON_CFLAGS = -g $(C_OPT) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wmissing-declarations -fno-strict-aliasing -march=native -m64 -I$(SPDK_ROOT_DIR)/include
 
-COMMON_CFLAGS += -Wformat -Wformat-security -Wformat-nonliteral
+COMMON_CFLAGS += -include $(SPDK_ROOT_DIR)/config.h
+
+ifeq ($(CONFIG_WERROR), y)
+COMMON_CFLAGS += -Werror
+endif
+
+ifeq ($(CONFIG_LTO),y)
+COMMON_CFLAGS += -flto
+LDFLAGS += -flto
+endif
+
+COMMON_CFLAGS += -Wformat -Wformat-security
 
 COMMON_CFLAGS += -D_GNU_SOURCE
 
@@ -54,6 +70,9 @@ COMMON_CFLAGS += -fPIC
 
 # Enable stack buffer overflow checking
 COMMON_CFLAGS += -fstack-protector
+
+# Prevent accidental multiple definitions of global variables
+COMMON_CFLAGS += -fno-common
 
 # Enable full RELRO - no lazy relocation (resolve everything at load time).
 # This allows the GOT to be made read-only early in the loading process.
@@ -84,29 +103,65 @@ LDFLAGS += --coverage
 endif
 endif
 
-CFLAGS   += $(COMMON_CFLAGS) -Wno-pointer-sign -std=gnu99
+include $(CONFIG_ENV)/env.mk
+
+ifeq ($(CONFIG_ASAN),y)
+COMMON_CFLAGS += -fsanitize=address
+LDFLAGS += -fsanitize=address
+endif
+
+ifeq ($(CONFIG_UBSAN),y)
+COMMON_CFLAGS += -fsanitize=undefined
+LDFLAGS += -fsanitize=undefined
+endif
+
+ifeq ($(CONFIG_TSAN),y)
+COMMON_CFLAGS += -fsanitize=thread
+LDFLAGS += -fsanitize=thread
+endif
+
+COMMON_CFLAGS += -pthread
+LDFLAGS += -pthread
+
+CFLAGS   += $(COMMON_CFLAGS) -Wno-pointer-sign -Wstrict-prototypes -Wold-style-definition -std=gnu99
+CXXFLAGS += $(COMMON_CFLAGS) -std=c++0x
+
+SYS_LIBS += -lrt
 
 MAKEFLAGS += --no-print-directory
 
-OBJS = $(C_SRCS:.c=.o)
+C_SRCS += $(C_SRCS-y)
+CXX_SRCS += $(CXX_SRCS-y)
+
+OBJS = $(C_SRCS:.c=.o) $(CXX_SRCS:.cpp=.o)
 
 DEPFLAGS = -MMD -MP -MF $*.d.tmp
 
 # Compile first input $< (.c) into $@ (.o)
 COMPILE_C=\
-	$(Q)echo "  CC $@"; \
+	$(Q)echo "  CC $S/$@"; \
 	$(CC) -o $@ $(DEPFLAGS) $(CFLAGS) -c $< && \
+	mv -f $*.d.tmp $*.d
+
+COMPILE_CXX=\
+	$(Q)echo "  CXX $S/$@"; \
+	$(CXX) -o $@ $(DEPFLAGS) $(CXXFLAGS) -c $< && \
 	mv -f $*.d.tmp $*.d
 
 # Link $(OBJS) and $(LIBS) into $@ (app)
 LINK_C=\
-	$(Q)echo "  LINK $@"; \
-	$(CC) -o $@ $(CPPFLAGS) $(LDFLAGS) $(OBJS) $(LIBS)
+	$(Q)echo "  LINK $S/$@"; \
+	$(CC) -o $@ $(CPPFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(SYS_LIBS)
+
+LINK_CXX=\
+	$(Q)echo "  LINK $S/$@"; \
+	$(CXX) -o $@ $(CPPFLAGS) $(LDFLAGS) $(OBJS) $(LIBS) $(SYS_LIBS)
 
 # Archive $(OBJS) into $@ (.a)
 LIB_C=\
-	$(Q)echo "  LIB $@"; \
-	ar crDs $@ $(OBJS)
+	$(Q)echo "  LIB $(notdir $@)"; \
+	rm -f $@; \
+	$(CCAR) crDs $@ $(OBJS)
 
 # Clean up generated files listed as arguments plus a default list
 CLEAN_C=\
@@ -115,25 +170,11 @@ CLEAN_C=\
 %.o: %.c %.d $(MAKEFILE_LIST)
 	$(COMPILE_C)
 
+%.o: %.cpp %.d $(MAKEFILE_LIST)
+	$(COMPILE_CXX)
+
 %.d: ;
 
-DPDK_DIR ?= $(CONFIG_DPDK_DIR)
-export DPDK_DIR_ABS = $(abspath $(DPDK_DIR))
-DPDK_INC_DIR ?= $(DPDK_DIR_ABS)/include
-DPDK_LIB_DIR ?= $(DPDK_DIR_ABS)/lib
-
-DPDK_INC = -I$(DPDK_INC_DIR)
-DPDK_LIB = -L$(DPDK_LIB_DIR) -lrte_eal -lrte_mempool -lrte_ring -Wl,-rpath=$(DPDK_LIB_DIR)
-# librte_malloc was removed after DPDK 2.1.  Link this library conditionally based on its
-#  existence to maintain backward compatibility.
-ifneq ($(wildcard $(DPDK_DIR_ABS)/lib/librte_malloc.*),)
-DPDK_LIB += -lrte_malloc
-endif
-
-# DPDK requires dl library for dlopen/dlclose on Linux.
-ifeq ($(OS),Linux)
-DPDK_LIB += -ldl
-endif
-ifeq ($(OS),FreeBSD)
-DPDK_LIB += -lexecinfo
-endif
+define spdk_lib_list_to_files
+	$(1:%=$(SPDK_ROOT_DIR)/build/lib/libspdk_%.a)
+endef

@@ -31,21 +31,11 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/../..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-CFLAGS += $(DPDK_INC)
+CFLAGS += $(ENV_CFLAGS)
+C_SRCS = bit_array.c crc32.c crc32c.c crc32_ieee.c fd.c io_channel.c string.c
+LIBNAME = util
 
-C_SRCS = file.c string.c pci.c
-
-LIB = libspdk_util.a
-
-all : $(LIB)
-
-clean :
-	$(CLEAN_C)
-
-$(LIB) : $(OBJS)
-	$(LIB_C)
-
-include $(SPDK_ROOT_DIR)/mk/spdk.deps.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

@@ -2,6 +2,7 @@
 
 rootdir=$(readlink -f $(dirname $0))
 source "$rootdir/scripts/autotest_common.sh"
+source "$rootdir/test/nvmf/common.sh"
 
 set -xe
 
@@ -10,7 +11,12 @@ if [ $EUID -ne 0 ]; then
 	exit 1
 fi
 
-trap "process_core; $rootdir/scripts/cleanup.sh; exit 1" SIGINT SIGTERM EXIT
+if [ $(uname -s) = Linux ]; then
+	# set core_pattern to a known value to avoid ABRT, systemd-coredump, etc.
+	echo "core" > /proc/sys/kernel/core_pattern
+fi
+
+trap "process_core; $rootdir/scripts/setup.sh reset; exit 1" SIGINT SIGTERM EXIT
 
 timing_enter autotest
 
@@ -19,6 +25,8 @@ out=$PWD
 cd $src
 
 if hash lcov; then
+	# setup output dir for unittest.sh
+	export UT_COVERAGE=$out/ut_coverage
 	export LCOV_OPTS="
 		--rc lcov_branch_coverage=1
 		--rc lcov_function_coverage=1
@@ -27,33 +35,103 @@ if hash lcov; then
 		--rc genhtml_legend=1
 		--rc geninfo_all_blocks=1
 		"
-	export LCOV="lcov $LCOV_OPTS"
-	export GENHTML="genhtml $LCOV_OPTS"
+	export LCOV="lcov $LCOV_OPTS --no-external"
 	# zero out coverage data
 	$LCOV -q -c -i -t "Baseline" -d $src -o cov_base.info
 fi
 
+# Make sure the disks are clean (no leftover partition tables)
+timing_enter cleanup
+if [ $(uname -s) = Linux ]; then
+	# Load the kernel driver
+	./scripts/setup.sh reset
+
+	# Let the kernel discover any filesystems or partitions
+	sleep 10
+
+	# Delete all partitions on NVMe devices
+	devs=`lsblk -l -o NAME | grep nvme | grep -v p` || true
+	for dev in $devs; do
+		parted -s /dev/$dev mklabel msdos
+	done
+fi
+timing_exit cleanup
+
 # set up huge pages
 timing_enter afterboot
-./scripts/configure_hugepages.sh 1024
+./scripts/setup.sh
 timing_exit afterboot
 
-./scripts/unbind.sh
+timing_enter nvmf_setup
+rdma_device_init
+timing_exit nvmf_setup
+
+timing_enter rbd_setup
+rbd_setup
+timing_exit rbd_setup
 
 #####################
 # Unit Tests
 #####################
 
+if [ $SPDK_TEST_UNITTEST -eq 1 ]; then
+	timing_enter unittest
+	run_test ./unittest.sh
+	timing_exit unittest
+fi
+
 timing_enter lib
 
-time test/lib/nvme/nvme.sh
-time test/lib/memory/memory.sh
-time test/lib/ioat/ioat.sh
+if [ $SPDK_TEST_BLOCKDEV -eq 1 ]; then
+	run_test test/lib/bdev/blockdev.sh
+fi
+
+if [ $SPDK_TEST_EVENT -eq 1 ]; then
+	run_test test/lib/event/event.sh
+fi
+
+if [ $SPDK_TEST_NVME -eq 1 ]; then
+	run_test test/lib/nvme/nvme.sh
+	# Only test hotplug without ASAN enabled. Since if it is
+	# enabled, it catches SEGV earlier than our handler which
+	# breaks the hotplug logic
+	if [ $SPDK_RUN_ASAN -eq 0 ]; then
+		run_test test/lib/nvme/hotplug.sh intel
+	fi
+fi
+
+run_test test/lib/env/env.sh
+
+if [ $SPDK_TEST_IOAT -eq 1 ]; then
+	run_test test/lib/ioat/ioat.sh
+fi
 
 timing_exit lib
 
-./scripts/cleanup.sh
+if [ $SPDK_TEST_ISCSI -eq 1 ]; then
+	run_test ./test/iscsi_tgt/iscsi_tgt.sh
+fi
+
+if [ $SPDK_TEST_BLOBFS -eq 1 ]; then
+	run_test ./test/blobfs/rocksdb/rocksdb.sh
+fi
+
+if [ $SPDK_TEST_NVMF -eq 1 ]; then
+	run_test ./test/nvmf/nvmf.sh
+fi
+
+if [ $SPDK_TEST_VHOST -eq 1 ]; then
+	timing_enter vhost
+	run_test ./test/vhost/spdk_vhost.sh --integrity-blk
+	run_test ./test/vhost/spdk_vhost.sh --integrity
+	timing_exit vhost
+fi
+
+timing_enter cleanup
+rbd_cleanup
+./scripts/setup.sh reset
 ./scripts/build_kmod.sh clean
+timing_exit cleanup
 
 timing_exit autotest
 chmod a+r $output_dir/timing.txt
@@ -66,12 +144,9 @@ process_core
 if hash lcov; then
 	# generate coverage data and combine with baseline
 	$LCOV -q -c -d $src -t "$(hostname)" -o cov_test.info
-	$LCOV -q -a cov_base.info -a cov_test.info -o cov_total.info
-	$LCOV -q -r cov_total.info '/usr/*' -o cov_total.info
-	$LCOV -q -r cov_total.info 'test/*' -o cov_total.info
-	$GENHTML cov_total.info -t "$(hostname)" -o $out/coverage
-	chmod -R a+rX $out/coverage
-	rm cov_base.info cov_test.info
-	mv cov_total.info $out/cov_total.info
-	find . -name "*.gcda" -delete
+	$LCOV -q -a cov_base.info -a cov_test.info -o $out/cov_total.info
+	$LCOV -q -r $out/cov_total.info '*/dpdk/*' -o $out/cov_total.info
+	$LCOV -q -r $out/cov_total.info '/usr/*' -o $out/cov_total.info
+	git clean -f "*.gcda"
+	rm -f cov_base.info cov_test.info OLD_STDOUT OLD_STDERR
 fi

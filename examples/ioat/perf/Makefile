@@ -31,24 +31,23 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(CURDIR)/../../..
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 
 APP = perf
 
 C_SRCS := perf.c
 
-CFLAGS += -I. $(DPDK_INC)
+CFLAGS += -I. $(ENV_CFLAGS)
 
-SPDK_LIBS += $(SPDK_ROOT_DIR)/lib/ioat/libspdk_ioat.a \
-	     $(SPDK_ROOT_DIR)/lib/util/libspdk_util.a \
-	     $(SPDK_ROOT_DIR)/lib/memory/libspdk_memory.a
+SPDK_LIB_LIST = ioat util log
 
-LIBS += $(SPDK_LIBS) -lpciaccess -lpthread $(DPDK_LIB) -lrt
+LIBS += $(SPDK_LIB_LINKER_ARGS) $(ENV_LINKER_ARGS)
 
 all: $(APP)
 
-$(APP): $(OBJS) $(SPDK_LIBS)
+$(APP): $(OBJS) $(SPDK_LIB_FILES) $(ENV_LIBS)
 	$(LINK_C)
 
 clean:
