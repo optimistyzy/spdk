@@ -31,23 +31,22 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
+#include "spdk/stdinc.h"
+
 #include <rte_config.h>
 #include <rte_lcore.h>
-#include <rte_malloc.h>
-#include <rte_eal.h>
-#include <rte_cycles.h>
-#include <rte_mempool.h>
-#include <pciaccess.h>
+
 #include "spdk/ioat.h"
-#include "spdk/pci.h"
+#include "spdk/env.h"
+#include "spdk/queue.h"
 #include "spdk/string.h"
 
 #define SRC_BUFFER_SIZE (512*1024)
+
+enum ioat_task_type {
+	IOAT_COPY_TYPE,
+	IOAT_FILL_TYPE,
+};
 
 struct user_config {
 	int queue_depth;
@@ -56,28 +55,34 @@ struct user_config {
 };
 
 struct ioat_device {
-	struct ioat_channel *ioat;
+	struct spdk_ioat_chan *ioat;
 	TAILQ_ENTRY(ioat_device) tailq;
 };
 
 static TAILQ_HEAD(, ioat_device) g_devices;
+static struct ioat_device *g_next_device;
 
 static struct user_config g_user_config;
 
 struct thread_entry {
+	struct spdk_ioat_chan *chan;
 	uint64_t xfer_completed;
 	uint64_t xfer_failed;
+	uint64_t fill_completed;
+	uint64_t fill_failed;
 	uint64_t current_queue_depth;
 	unsigned lcore_id;
 	bool is_draining;
-	struct rte_mempool *data_pool;
-	struct rte_mempool *task_pool;
+	struct spdk_mempool *data_pool;
+	struct spdk_mempool *task_pool;
 };
 
 struct ioat_task {
+	enum ioat_task_type type;
 	struct thread_entry *thread_entry;
 	void *buffer;
 	int len;
+	uint64_t fill_pattern;
 	void *src;
 	void *dst;
 };
@@ -114,7 +119,7 @@ ioat_exit(void)
 		dev = TAILQ_FIRST(&g_devices);
 		TAILQ_REMOVE(&g_devices, dev, tailq);
 		if (dev->ioat) {
-			ioat_detach(dev->ioat);
+			spdk_ioat_detach(dev->ioat);
 		}
 		free(dev);
 	}
@@ -124,14 +129,29 @@ static void prepare_ioat_task(struct thread_entry *thread_entry, struct ioat_tas
 	int len;
 	int src_offset;
 	int dst_offset;
+	int num_ddwords;
+	uint64_t fill_pattern;
 
-	src_offset = rand_r(&seed) % SRC_BUFFER_SIZE;
-	len = rand_r(&seed) % (SRC_BUFFER_SIZE - src_offset);
-	dst_offset = rand_r(&seed) % (SRC_BUFFER_SIZE - len);
+	if (ioat_task->type == IOAT_FILL_TYPE) {
+		fill_pattern = rand_r(&seed);
+		fill_pattern = fill_pattern << 32 | rand_r(&seed);
 
-	memset(ioat_task->buffer, 0, SRC_BUFFER_SIZE);
+		/* ensure that the length of memset block is 8 Bytes aligned */
+		num_ddwords = (rand_r(&seed) % SRC_BUFFER_SIZE) / 8;
+		len = num_ddwords * 8;
+		if (len < 8)
+			len = 8;
+		dst_offset = rand_r(&seed) % (SRC_BUFFER_SIZE - len);
+		ioat_task->fill_pattern = fill_pattern;
+	} else {
+		src_offset = rand_r(&seed) % SRC_BUFFER_SIZE;
+		len = rand_r(&seed) % (SRC_BUFFER_SIZE - src_offset);
+		dst_offset = rand_r(&seed) % (SRC_BUFFER_SIZE - len);
+
+		memset(ioat_task->buffer, 0, SRC_BUFFER_SIZE);
+		ioat_task->src =  g_src + src_offset;
+	}
 	ioat_task->len = len;
-	ioat_task->src =  g_src + src_offset;
 	ioat_task->dst = ioat_task->buffer + dst_offset;
 	ioat_task->thread_entry = thread_entry;
 }
@@ -139,88 +159,80 @@ static void prepare_ioat_task(struct thread_entry *thread_entry, struct ioat_tas
 static void
 ioat_done(void *cb_arg)
 {
+	char *value;
+	int i, failed = 0;
 	struct ioat_task *ioat_task = (struct ioat_task *)cb_arg;
 	struct thread_entry *thread_entry = ioat_task->thread_entry;
 
-	if (memcmp(ioat_task->src, ioat_task->dst, ioat_task->len)) {
-		thread_entry->xfer_failed++;
+	if (ioat_task->type == IOAT_FILL_TYPE) {
+		value = ioat_task->dst;
+		for (i = 0; i < ioat_task->len / 8; i++) {
+			if (memcmp(value, &ioat_task->fill_pattern, 8) != 0) {
+				thread_entry->fill_failed++;
+				failed = 1;
+				break;
+			}
+			value += 8;
+		}
+		if (!failed)
+			thread_entry->fill_completed++;
 	} else {
-		thread_entry->xfer_completed++;
+		if (memcmp(ioat_task->src, ioat_task->dst, ioat_task->len)) {
+			thread_entry->xfer_failed++;
+		} else {
+			thread_entry->xfer_completed++;
+		}
 	}
+
 	thread_entry->current_queue_depth--;
 	if (thread_entry->is_draining) {
-		rte_mempool_put(thread_entry->data_pool, ioat_task->buffer);
-		rte_mempool_put(thread_entry->task_pool, ioat_task);
+		spdk_mempool_put(thread_entry->data_pool, ioat_task->buffer);
+		spdk_mempool_put(thread_entry->task_pool, ioat_task);
 	} else {
 		prepare_ioat_task(thread_entry, ioat_task);
 		submit_single_xfer(ioat_task);
 	}
 }
 
+static bool
+probe_cb(void *cb_ctx, struct spdk_pci_device *pci_dev)
+{
+	printf(" Found matching device at %04x:%02x:%02x.%x "
+	       "vendor:0x%04x device:0x%04x\n",
+	       spdk_pci_device_get_domain(pci_dev),
+	       spdk_pci_device_get_bus(pci_dev), spdk_pci_device_get_dev(pci_dev),
+	       spdk_pci_device_get_func(pci_dev),
+	       spdk_pci_device_get_vendor_id(pci_dev), spdk_pci_device_get_device_id(pci_dev));
+
+	return true;
+}
+
+static void
+attach_cb(void *cb_ctx, struct spdk_pci_device *pci_dev, struct spdk_ioat_chan *ioat)
+{
+	struct ioat_device *dev;
+
+	dev = malloc(sizeof(*dev));
+	if (dev == NULL) {
+		printf("Failed to allocate device struct\n");
+		return;
+	}
+	memset(dev, 0, sizeof(*dev));
+
+	dev->ioat = ioat;
+	TAILQ_INSERT_TAIL(&g_devices, dev, tailq);
+}
+
 static int
 ioat_init(void)
 {
-	struct pci_device_iterator *iter;
-	struct pci_device *pci_dev;
-	int err = 0;
-	struct pci_id_match match;
-	struct ioat_device *dev;
-
-	pci_system_init();
 	TAILQ_INIT(&g_devices);
 
-	match.vendor_id		= PCI_MATCH_ANY;
-	match.subvendor_id	= PCI_MATCH_ANY;
-	match.subdevice_id	= PCI_MATCH_ANY;
-	match.device_id		= PCI_MATCH_ANY;
-	match.device_class	= 0x088000;
-	match.device_class_mask	= 0xFFFFFF;
-
-	iter = pci_id_match_iterator_create(&match);
-
-	while ((pci_dev = pci_device_next(iter)) != NULL) {
-		/* Check if the PCI devices is a supported IOAT channel. */
-		if (!(ioat_pci_device_match_id(pci_dev->vendor_id,
-					       pci_dev->device_id))) {
-			continue;
-		}
-
-		printf(" Found matching device at %d:%d:%d "
-		       "vendor:0x%04x device:0x%04x\n   name:%s\n",
-		       pci_dev->bus, pci_dev->dev, pci_dev->func,
-		       pci_dev->vendor_id, pci_dev->device_id,
-		       pci_device_get_device_name(pci_dev));
-
-		if (pci_device_has_non_uio_driver(pci_dev)) {
-			printf("Device has non-uio kernel driver, skipping...\n");
-			continue;
-		}
-
-		pci_device_probe(pci_dev);
-
-		dev = malloc(sizeof(*dev));
-		if (dev == NULL) {
-			printf("Failed to allocate device struct\n");
-			err = -1;
-			goto cleanup;
-		}
-		memset(dev, 0, sizeof(*dev));
-
-		dev->ioat = ioat_attach(pci_dev);
-		if (dev->ioat == NULL) {
-			free(dev);
-			/* Likely no device found. */
-			err = -1;
-			goto cleanup;
-		}
-		TAILQ_INSERT_TAIL(&g_devices, dev, tailq);
+	if (spdk_ioat_probe(NULL, probe_cb, attach_cb) != 0) {
+		fprintf(stderr, "ioat_probe() failed\n");
+		return 1;
 	}
 
-cleanup:
-	pci_iterator_destroy(iter);
-	if (err != 0) {
-		ioat_exit();
-	}
 	return 0;
 }
 
@@ -263,7 +275,7 @@ parse_args(int argc, char **argv)
 		usage(argv[0]);
 		return 1;
 	}
-	optind = 1;
+
 	return 0;
 }
 
@@ -271,14 +283,19 @@ static void
 drain_xfers(struct thread_entry *thread_entry)
 {
 	while (thread_entry->current_queue_depth > 0) {
-		ioat_process_events();
+		spdk_ioat_process_events(thread_entry->chan);
 	}
 }
 
 static void
 submit_single_xfer(struct ioat_task *ioat_task)
 {
-	ioat_submit_copy(ioat_task, ioat_done, ioat_task->dst, ioat_task->src, ioat_task->len);
+	if (ioat_task->type == IOAT_FILL_TYPE)
+		spdk_ioat_submit_fill(ioat_task->thread_entry->chan, ioat_task, ioat_done,
+				      ioat_task->dst, ioat_task->fill_pattern, ioat_task->len);
+	else
+		spdk_ioat_submit_copy(ioat_task->thread_entry->chan, ioat_task, ioat_done,
+				      ioat_task->dst, ioat_task->src, ioat_task->len);
 	ioat_task->thread_entry->current_queue_depth++;
 }
 
@@ -287,9 +304,14 @@ submit_xfers(struct thread_entry *thread_entry, uint64_t queue_depth)
 {
 	while (queue_depth-- > 0) {
 		struct ioat_task *ioat_task = NULL;
-		rte_mempool_get(thread_entry->task_pool, (void **)&ioat_task);
-		rte_mempool_get(thread_entry->data_pool, &(ioat_task->buffer));
+		ioat_task = spdk_mempool_get(thread_entry->task_pool);
+		ioat_task->buffer = spdk_mempool_get(thread_entry->data_pool);
 
+		ioat_task->type = IOAT_COPY_TYPE;
+		if (spdk_ioat_get_dma_capabilities(thread_entry->chan) & SPDK_IOAT_ENGINE_FILL_SUPPORTED) {
+			if (queue_depth % 2)
+				ioat_task->type = IOAT_FILL_TYPE;
+		}
 		prepare_ioat_task(thread_entry, ioat_task);
 		submit_single_xfer(ioat_task);
 	}
@@ -302,38 +324,35 @@ work_fn(void *arg)
 	char buf_pool_name[20], task_pool_name[20];
 	struct thread_entry *t = (struct thread_entry *)arg;
 
+	if (!t->chan) {
+		return 0;
+	}
+
 	t->lcore_id = rte_lcore_id();
 
 	snprintf(buf_pool_name, sizeof(buf_pool_name), "buf_pool_%d", rte_lcore_id());
 	snprintf(task_pool_name, sizeof(task_pool_name), "task_pool_%d", rte_lcore_id());
-	t->data_pool = rte_mempool_create(buf_pool_name, g_user_config.queue_depth, SRC_BUFFER_SIZE, 0, 0,
-					  NULL, NULL,
-					  NULL, NULL, SOCKET_ID_ANY, 0);
-	t->task_pool = rte_mempool_create(task_pool_name, g_user_config.queue_depth,
-					  sizeof(struct ioat_task), 0, 0, NULL, NULL,
-					  NULL, NULL, SOCKET_ID_ANY, 0);
+	t->data_pool = spdk_mempool_create(buf_pool_name, g_user_config.queue_depth, SRC_BUFFER_SIZE,
+					   SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+					   SPDK_ENV_SOCKET_ID_ANY);
+	t->task_pool = spdk_mempool_create(task_pool_name, g_user_config.queue_depth,
+					   sizeof(struct ioat_task),
+					   SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+					   SPDK_ENV_SOCKET_ID_ANY);
 	if (!t->data_pool || !t->task_pool) {
 		fprintf(stderr, "Could not allocate buffer pool.\n");
 		return 1;
 	}
 
-	if (ioat_register_thread() != 0) {
-		fprintf(stderr, "lcore %u: No ioat channels found. Check that ioatdma driver is unloaded.\n",
-			rte_lcore_id());
-		return 0;
-	}
-
-	tsc_end = rte_get_timer_cycles() + g_user_config.time_in_sec * rte_get_timer_hz();
+	tsc_end = spdk_get_ticks() + g_user_config.time_in_sec * spdk_get_ticks_hz();
 
 	submit_xfers(t, g_user_config.queue_depth);
-	while (rte_get_timer_cycles() < tsc_end) {
-		ioat_process_events();
+	while (spdk_get_ticks() < tsc_end) {
+		spdk_ioat_process_events(t->chan);
 	}
 
 	t->is_draining = true;
 	drain_xfers(t);
-
-	ioat_unregister_thread();
 
 	return 0;
 }
@@ -343,7 +362,7 @@ init_src_buffer(void)
 {
 	int i;
 
-	g_src = rte_malloc(NULL, SRC_BUFFER_SIZE, 512);
+	g_src = spdk_dma_zmalloc(SRC_BUFFER_SIZE, 512, NULL);
 	if (g_src == NULL) {
 		fprintf(stderr, "Allocate src buffer failed\n");
 		return -1;
@@ -359,21 +378,12 @@ init_src_buffer(void)
 static int
 init(void)
 {
-	char *core_mask_conf;
+	struct spdk_env_opts opts;
 
-	core_mask_conf = sprintf_alloc("-c %s", g_user_config.core_mask);
-	if (!core_mask_conf) {
-		return 1;
-	}
-
-	char *ealargs[] = {"verify", core_mask_conf, "-n 4", "--no-pci"};
-	if (rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]), ealargs) < 0) {
-		free(core_mask_conf);
-		fprintf(stderr, "Could not init eal\n");
-		return 1;
-	}
-
-	free(core_mask_conf);
+	spdk_env_opts_init(&opts);
+	opts.name = "verify";
+	opts.core_mask = g_user_config.core_mask;
+	spdk_env_init(&opts);
 
 	if (init_src_buffer() != 0) {
 		fprintf(stderr, "Could not init src buffer\n");
@@ -397,18 +407,37 @@ dump_result(struct thread_entry *threads, int len)
 	for (i = 0; i < len; i++) {
 		struct thread_entry *t = &threads[i];
 		total_completed += t->xfer_completed;
+		total_completed += t->fill_completed;
 		total_failed += t->xfer_failed;
+		total_failed += t->fill_failed;
 		if (t->xfer_completed || t->xfer_failed)
-			printf("lcore = %d, success = %ld, failed = %ld \n",
-			       t->lcore_id, t->xfer_completed, t->xfer_failed);
+			printf("lcore = %d, copy success = %ld, copy failed = %ld, fill success = %ld, fill failed = %ld \n",
+			       t->lcore_id, t->xfer_completed, t->xfer_failed, t->fill_completed, t->fill_failed);
 	}
 	return total_failed ? 1 : 0;
+}
+
+static struct spdk_ioat_chan *
+get_next_chan(void)
+{
+	struct spdk_ioat_chan *chan;
+
+	if (g_next_device == NULL) {
+		fprintf(stderr, "Not enough ioat channels found. Check that ioatdma driver is unloaded.\n");
+		return NULL;
+	}
+
+	chan = g_next_device->ioat;
+
+	g_next_device = TAILQ_NEXT(g_next_device, tailq);
+
+	return chan;
 }
 
 int
 main(int argc, char **argv)
 {
-	unsigned lcore_id;
+	uint32_t i, current_core;
 	struct thread_entry threads[RTE_MAX_LCORE] = {};
 	int rc;
 
@@ -422,26 +451,35 @@ main(int argc, char **argv)
 
 	dump_user_config(&g_user_config);
 
-	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-		rte_eal_remote_launch(work_fn, &threads[lcore_id], lcore_id);
+	g_next_device = TAILQ_FIRST(&g_devices);
+
+	current_core = spdk_env_get_current_core();
+	SPDK_ENV_FOREACH_CORE(i) {
+		if (i != current_core) {
+			threads[i].chan = get_next_chan();
+			rte_eal_remote_launch(work_fn, &threads[i], i);
+		}
 	}
 
-	if (work_fn(&threads[rte_get_master_lcore()]) != 0) {
+	threads[current_core].chan = get_next_chan();
+	if (work_fn(&threads[current_core]) != 0) {
 		rc = 1;
 		goto cleanup;
 	}
 
-	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-		if (rte_eal_wait_lcore(lcore_id) != 0) {
-			rc = 1;
-			goto cleanup;
+	SPDK_ENV_FOREACH_CORE(i) {
+		if (i != current_core) {
+			if (rte_eal_wait_lcore(i) != 0) {
+				rc = 1;
+				goto cleanup;
+			}
 		}
 	}
 
 	rc = dump_result(threads, RTE_MAX_LCORE);
 
 cleanup:
-	rte_free(g_src);
+	spdk_dma_free(g_src);
 	ioat_exit();
 
 	return rc;

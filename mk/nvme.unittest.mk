@@ -31,23 +31,26 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-SPDK_ROOT_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/..
 NVME_DIR := $(SPDK_ROOT_DIR)/lib/nvme
 
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
+include $(SPDK_ROOT_DIR)/mk/spdk.mock.unittest.mk
 
 C_SRCS = $(TEST_FILE) $(OTHER_FILES)
 
-CFLAGS += -I$(SPDK_ROOT_DIR)/lib -include $(SPDK_ROOT_DIR)/test/lib/nvme/unit/nvme_impl.h
+CFLAGS += -I$(SPDK_ROOT_DIR)/lib
 CFLAGS += -I$(SPDK_ROOT_DIR)/test
 
-LIBS += -lcunit -lpthread
+SPDK_LIB_LIST = util log spdk_mock
+
+LIBS += -lcunit $(SPDK_LIB_LINKER_ARGS)
 
 APP = $(TEST_FILE:.c=)
 
 all: $(APP)
 
-$(APP) : $(OBJS)
+$(APP) : $(OBJS) $(SPDK_LIB_FILES)
 	$(LINK_C)
 
 clean:

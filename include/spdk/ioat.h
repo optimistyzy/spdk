@@ -32,72 +32,132 @@
  */
 
 /** \file
- * This file defines the public interface to the I/OAT DMA engine driver.
+ * I/OAT DMA engine driver public interface
  */
 
-#ifndef __IOAT_H__
-#define __IOAT_H__
+#ifndef SPDK_IOAT_H
+#define SPDK_IOAT_H
 
-#include <inttypes.h>
-#include <stdbool.h>
+#include "spdk/stdinc.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "spdk/env.h"
+
+/**
+ * Opaque handle for a single I/OAT channel returned by \ref spdk_ioat_probe().
+ */
+struct spdk_ioat_chan;
 
 /**
  * Signature for callback function invoked when a request is completed.
- */
-typedef void (*ioat_callback_t)(void *arg);
-
-/**
- * Returns true if vendor_id and device_id match a known IOAT PCI device ID.
- */
-bool ioat_pci_device_match_id(uint16_t vendor_id, uint16_t device_id);
-
-/**
- * Attach an I/OAT PCI device to the I/OAT userspace driver.
  *
- * To stop using the the device and release its associated resources,
- * call \ref ioat_detach with the ioat_channel instance returned by this function.
+ * \param arg User-specified opaque value corresponding to cb_arg from the request submission.
  */
-struct ioat_channel *ioat_attach(void *device);
+typedef void (*spdk_ioat_req_cb)(void *arg);
 
 /**
- * Detaches specified device returned by \ref ioat_attach() from the I/OAT driver.
+ * Callback for spdk_ioat_probe() enumeration.
+ *
+ * \param cb_ctx User-specified opaque value corresponding to cb_ctx from spdk_ioat_probe().
+ * \param pci_dev PCI device that is being probed.
+ *
+ * \return true to attach to this device.
  */
-int ioat_detach(struct ioat_channel *ioat);
+typedef bool (*spdk_ioat_probe_cb)(void *cb_ctx, struct spdk_pci_device *pci_dev);
 
 /**
- * Request a DMA engine channel for the calling thread.
+ * Callback for spdk_ioat_probe() to report a device that has been attached to the userspace I/OAT driver.
  *
- * Must be called before submitting any requests from a thread.
- *
- * The \ref ioat_unregister_thread() function can be called to release the channel.
+ * \param cb_ctx User-specified opaque value corresponding to cb_ctx from spdk_ioat_probe().
+ * \param pci_dev PCI device that was attached to the driver.
+ * \param ioat I/OAT channel that was attached to the driver.
  */
-int ioat_register_thread(void);
+typedef void (*spdk_ioat_attach_cb)(void *cb_ctx, struct spdk_pci_device *pci_dev,
+				    struct spdk_ioat_chan *ioat);
 
 /**
- * Unregister the current thread's I/OAT channel.
+ * \brief Enumerate the I/OAT devices attached to the system and attach the userspace I/OAT driver
+ * to them if desired.
  *
- * This function can be called after \ref ioat_register_thread() to release the thread's
- * DMA engine channel for use by other threads.
+ * \param cb_ctx Opaque value which will be passed back in cb_ctx parameter of the callbacks.
+ * \param probe_cb will be called once per I/OAT device found in the system.
+ * \param attach_cb will be called for devices for which probe_cb returned true once the I/OAT
+ * controller has been attached to the userspace driver.
+ *
+ * If called more than once, only devices that are not already attached to the SPDK I/OAT driver
+ * will be reported.
+ *
+ * To stop using the the controller and release its associated resources,
+ * call \ref spdk_ioat_detach with the ioat_channel instance returned by this function.
  */
-void ioat_unregister_thread(void);
+int spdk_ioat_probe(void *cb_ctx, spdk_ioat_probe_cb probe_cb, spdk_ioat_attach_cb attach_cb);
+
+/**
+ * Detaches specified device returned by \ref spdk_ioat_probe() from the I/OAT driver.
+ *
+ * \param ioat I/OAT channel to detach from the driver.
+ */
+int spdk_ioat_detach(struct spdk_ioat_chan *ioat);
 
 /**
  * Submit a DMA engine memory copy request.
  *
- * Before submitting any requests on a thread, the thread must be registered
- * using the \ref ioat_register_thread() function.
+ * \param chan I/OAT channel to submit request.
+ * \param cb_arg Opaque value which will be passed back as the arg parameter in the completion callback.
+ * \param cb_fn Callback function which will be called when the request is complete.
+ * \param dst Destination virtual address.
+ * \param src Source virtual address.
+ * \param nbytes Number of bytes to copy.
  */
-int64_t ioat_submit_copy(void *cb_arg, ioat_callback_t cb_fn,
-			 void *dst, const void *src, uint64_t nbytes);
+int spdk_ioat_submit_copy(struct spdk_ioat_chan *chan,
+			  void *cb_arg, spdk_ioat_req_cb cb_fn,
+			  void *dst, const void *src, uint64_t nbytes);
 
 /**
- * Check for completed requests on the current thread.
+ * Submit a DMA engine memory fill request.
  *
- * Before submitting any requests on a thread, the thread must be registered
- * using the \ref ioat_register_thread() function.
+ * \param chan I/OAT channel to submit request.
+ * \param cb_arg Opaque value which will be passed back as the cb_arg parameter in the completion callback.
+ * \param cb_fn Callback function which will be called when the request is complete.
+ * \param dst Destination virtual address.
+ * \param fill_pattern Repeating eight-byte pattern to use for memory fill.
+ * \param nbytes Number of bytes to fill.
+ */
+int spdk_ioat_submit_fill(struct spdk_ioat_chan *chan,
+			  void *cb_arg, spdk_ioat_req_cb cb_fn,
+			  void *dst, uint64_t fill_pattern, uint64_t nbytes);
+
+/**
+ * Check for completed requests on an I/OAT channel.
+ *
+ * \param chan I/OAT channel to check for completions.
  *
  * \returns 0 on success or negative if something went wrong.
  */
-int ioat_process_events(void);
+int spdk_ioat_process_events(struct spdk_ioat_chan *chan);
+
+/**
+ * DMA engine capability flags
+ */
+enum spdk_ioat_dma_capability_flags {
+	SPDK_IOAT_ENGINE_COPY_SUPPORTED	= 0x1, /**< The memory copy is supported */
+	SPDK_IOAT_ENGINE_FILL_SUPPORTED	= 0x2, /**< The memory fill is supported */
+};
+
+/**
+ * Get the DMA engine capabilities.
+ *
+ * \param chan I/OAT channel to query.
+ *
+ * \return A combination of flags from \ref spdk_ioat_dma_capability_flags.
+ */
+uint32_t spdk_ioat_get_dma_capabilities(struct spdk_ioat_chan *chan);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

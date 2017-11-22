@@ -31,10 +31,20 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/** \file
+ * Memory-mapped I/O utility functions
+ */
+
 #ifndef SPDK_MMIO_H
 #define SPDK_MMIO_H
 
-#include <inttypes.h>
+#include "spdk/stdinc.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "spdk/barrier.h"
 
 #ifdef __x86_64__
 #define SPDK_MMIO_64BIT	1 /* Can do atomic 64-bit memory read/write (over PCIe) */
@@ -42,15 +52,45 @@
 #define SPDK_MMIO_64BIT	0
 #endif
 
+static inline uint8_t
+spdk_mmio_read_1(const volatile uint8_t *addr)
+{
+	spdk_compiler_barrier();
+	return *addr;
+}
+
+static inline void
+spdk_mmio_write_1(volatile uint8_t *addr, uint8_t val)
+{
+	spdk_compiler_barrier();
+	*addr = val;
+}
+
+static inline uint16_t
+spdk_mmio_read_2(const volatile uint16_t *addr)
+{
+	spdk_compiler_barrier();
+	return *addr;
+}
+
+static inline void
+spdk_mmio_write_2(volatile uint16_t *addr, uint16_t val)
+{
+	spdk_compiler_barrier();
+	*addr = val;
+}
+
 static inline uint32_t
 spdk_mmio_read_4(const volatile uint32_t *addr)
 {
+	spdk_compiler_barrier();
 	return *addr;
 }
 
 static inline void
 spdk_mmio_write_4(volatile uint32_t *addr, uint32_t val)
 {
+	spdk_compiler_barrier();
 	*addr = val;
 }
 
@@ -59,6 +99,8 @@ spdk_mmio_read_8(volatile uint64_t *addr)
 {
 	uint64_t val;
 	volatile uint32_t *addr32 = (volatile uint32_t *)addr;
+
+	spdk_compiler_barrier();
 
 	if (SPDK_MMIO_64BIT) {
 		val = *addr;
@@ -80,6 +122,8 @@ spdk_mmio_write_8(volatile uint64_t *addr, uint64_t val)
 {
 	volatile uint32_t *addr32 = (volatile uint32_t *)addr;
 
+	spdk_compiler_barrier();
+
 	if (SPDK_MMIO_64BIT) {
 		*addr = val;
 	} else {
@@ -87,5 +131,9 @@ spdk_mmio_write_8(volatile uint64_t *addr, uint64_t val)
 		addr32[1] = (uint32_t)(val >> 32);
 	}
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

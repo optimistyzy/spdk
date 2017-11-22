@@ -1,15 +1,19 @@
-DOXYFILES = Doxyfile.ioat Doxyfile.nvme
-OUTPUT_DIRS = $(patsubst Doxyfile.%,output.%,$(DOXYFILES))
-
 all: doc
 
 .PHONY: all doc clean
 
-doc: $(OUTPUT_DIRS)
+doc: output
 
-output.%: Doxyfile.%
+changelog.md: ../CHANGELOG.md
+	sed -e 's/^# Changelog/# Changelog {#changelog}/' \
+	    -e 's/^##/#/' \
+	    -e 's/^# \(\(v..\...\):.*\)/# \1 {#changelog-\2}/' \
+	    -e '/# v..\...:/s/\./-/2' \
+	    < $< > $@
+
+output: Doxyfile changelog.md
 	rm -rf $@
-	doxygen $^
+	doxygen Doxyfile
 
 clean:
-	rm -rf $(OUTPUT_DIRS)
+	rm -rf output changelog.md

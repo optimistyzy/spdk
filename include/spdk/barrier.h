@@ -31,10 +31,30 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/** \file
+ * Memory barriers
+ */
+
 #ifndef SPDK_BARRIER_H
 #define SPDK_BARRIER_H
 
-#define wmb()	__asm volatile("sfence" ::: "memory")
-#define mb()	__asm volatile("mfence" ::: "memory")
+#include "spdk/stdinc.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** Compiler memory barrier */
+#define spdk_compiler_barrier() __asm volatile("" ::: "memory")
+
+/** Write memory barrier */
+#define spdk_wmb()	__asm volatile("sfence" ::: "memory")
+
+/** Full read/write memory barrier */
+#define spdk_mb()	__asm volatile("mfence" ::: "memory")
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

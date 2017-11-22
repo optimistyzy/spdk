@@ -31,17 +31,42 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+S :=
+
 SPDK_ROOT_DIR := $(CURDIR)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y += lib test examples
+DIRS-y += lib test examples app
 
-.PHONY: all clean $(DIRS-y)
+.PHONY: all clean $(DIRS-y) config.h CONFIG.local mk/cc.mk
+
+ifeq ($(CURDIR)/dpdk/build,$(CONFIG_DPDK_DIR))
+DPDKBUILD = dpdkbuild
+DIRS-y += dpdkbuild
+endif
 
 all: $(DIRS-y)
 clean: $(DIRS-y)
+	$(Q)rm -f mk/cc.mk
+	$(Q)rm -f config.h
 
+lib: $(DPDKBUILD)
+app: lib
 test: lib
 examples: lib
+pkgdep:
+	sh ./scripts/pkgdep.sh
+
+$(DIRS-y): mk/cc.mk config.h
+
+mk/cc.mk:
+	$(Q)scripts/detect_cc.sh --cc=$(CC) --cxx=$(CXX) --lto=$(CONFIG_LTO) > $@.tmp; \
+	cmp -s $@.tmp $@ || mv $@.tmp $@ ; \
+	rm -f $@.tmp
+
+config.h: CONFIG CONFIG.local scripts/genconfig.py
+	$(Q)python scripts/genconfig.py $(MAKEFLAGS) > $@.tmp; \
+	cmp -s $@.tmp $@ || mv $@.tmp $@ ; \
+	rm -f $@.tmp
 
 include $(SPDK_ROOT_DIR)/mk/spdk.subdirs.mk

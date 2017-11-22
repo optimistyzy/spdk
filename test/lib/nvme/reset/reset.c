@@ -31,32 +31,25 @@
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <stdbool.h>
-#include <string.h>
-#include <unistd.h>
-
-#include <pciaccess.h>
+#include "spdk/stdinc.h"
 
 #include <rte_config.h>
-#include <rte_cycles.h>
 #include <rte_mempool.h>
-#include <rte_malloc.h>
 #include <rte_lcore.h>
 
-#include "spdk/file.h"
 #include "spdk/nvme.h"
-#include "spdk/pci.h"
+#include "spdk/env.h"
 #include "spdk/string.h"
 
 struct ctrlr_entry {
-	struct nvme_controller	*ctrlr;
+	struct spdk_nvme_ctrlr	*ctrlr;
 	struct ctrlr_entry	*next;
 	char			name[1024];
 };
 
 struct ns_entry {
-	struct nvme_namespace	*ns;
+	struct spdk_nvme_ns	*ns;
+	struct spdk_nvme_ctrlr	*ctrlr;
 	struct ns_entry		*next;
 	uint32_t		io_size_blocks;
 	uint64_t		size_in_ios;
@@ -65,7 +58,7 @@ struct ns_entry {
 
 struct ns_worker_ctx {
 	struct ns_entry		*entry;
-	struct ctrlr_entry	*ctr_entry;
+	struct spdk_nvme_qpair	*qpair;
 	uint64_t		io_completed;
 	uint64_t		io_completed_error;
 	uint64_t		io_submitted;
@@ -86,7 +79,6 @@ struct worker_thread {
 	unsigned		lcore;
 };
 
-struct rte_mempool *request_mempool;
 static struct rte_mempool *task_pool;
 
 static struct ctrlr_entry *g_controllers = NULL;
@@ -103,10 +95,15 @@ static int g_queue_depth;
 static int g_time_in_sec;
 
 static void
-register_ns(struct nvme_controller *ctrlr, struct nvme_namespace *ns)
+register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 {
 	struct ns_entry *entry;
-	const struct nvme_controller_data *cdata;
+	const struct spdk_nvme_ctrlr_data *cdata;
+
+	if (!spdk_nvme_ns_is_active(ns)) {
+		printf("Skipping inactive NS %u\n", spdk_nvme_ns_get_id(ns));
+		return;
+	}
 
 	entry = malloc(sizeof(struct ns_entry));
 	if (entry == NULL) {
@@ -114,12 +111,13 @@ register_ns(struct nvme_controller *ctrlr, struct nvme_namespace *ns)
 		exit(1);
 	}
 
-	cdata = nvme_ctrlr_get_data(ctrlr);
+	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 
 	entry->ns = ns;
-	entry->size_in_ios = nvme_ns_get_size(ns) /
+	entry->ctrlr = ctrlr;
+	entry->size_in_ios = spdk_nvme_ns_get_size(ns) /
 			     g_io_size_bytes;
-	entry->io_size_blocks = g_io_size_bytes / nvme_ns_get_sector_size(ns);
+	entry->io_size_blocks = g_io_size_bytes / spdk_nvme_ns_get_sector_size(ns);
 
 	snprintf(entry->name, 44, "%-20.20s (%-20.20s)", cdata->mn, cdata->sn);
 
@@ -129,9 +127,10 @@ register_ns(struct nvme_controller *ctrlr, struct nvme_namespace *ns)
 }
 
 static void
-register_ctrlr(struct nvme_controller *ctrlr)
+register_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int nsid, num_ns;
+	struct spdk_nvme_ns *ns;
 	struct ctrlr_entry *entry = malloc(sizeof(struct ctrlr_entry));
 
 	if (entry == NULL) {
@@ -143,9 +142,13 @@ register_ctrlr(struct nvme_controller *ctrlr)
 	entry->next = g_controllers;
 	g_controllers = entry;
 
-	num_ns = nvme_ctrlr_get_num_ns(ctrlr);
+	num_ns = spdk_nvme_ctrlr_get_num_ns(ctrlr);
 	for (nsid = 1; nsid <= num_ns; nsid++) {
-		register_ns(ctrlr, nvme_ctrlr_get_ns(ctrlr, nsid));
+		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+		if (ns == NULL) {
+			continue;
+		}
+		register_ns(ctrlr, ns);
 	}
 }
 
@@ -153,14 +156,14 @@ static void task_ctor(struct rte_mempool *mp, void *arg, void *__task, unsigned 
 {
 	struct reset_task *task = __task;
 
-	task->buf = rte_malloc(NULL, g_io_size_bytes, 0x200);
+	task->buf = spdk_dma_zmalloc(g_io_size_bytes, 0x200, NULL);
 	if (task->buf == NULL) {
-		fprintf(stderr, "task->buf rte_malloc failed\n");
+		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
 		exit(1);
 	}
 }
 
-static void io_complete(void *ctx, const struct nvme_completion *completion);
+static void io_complete(void *ctx, const struct spdk_nvme_cpl *completion);
 
 static __thread unsigned int seed = 0;
 
@@ -191,11 +194,13 @@ submit_single_io(struct ns_worker_ctx *ns_ctx)
 
 	if ((g_rw_percentage == 100) ||
 	    (g_rw_percentage != 0 && ((rand_r(&seed) % 100) < g_rw_percentage))) {
-		rc = nvme_ns_cmd_read(entry->ns, task->buf, offset_in_ios * entry->io_size_blocks,
-				      entry->io_size_blocks, io_complete, task, 0);
+		rc = spdk_nvme_ns_cmd_read(entry->ns, ns_ctx->qpair, task->buf,
+					   offset_in_ios * entry->io_size_blocks,
+					   entry->io_size_blocks, io_complete, task, 0);
 	} else {
-		rc = nvme_ns_cmd_write(entry->ns, task->buf, offset_in_ios * entry->io_size_blocks,
-				       entry->io_size_blocks, io_complete, task, 0);
+		rc = spdk_nvme_ns_cmd_write(entry->ns, ns_ctx->qpair, task->buf,
+					    offset_in_ios * entry->io_size_blocks,
+					    entry->io_size_blocks, io_complete, task, 0);
 	}
 
 	if (rc != 0) {
@@ -206,14 +211,14 @@ submit_single_io(struct ns_worker_ctx *ns_ctx)
 }
 
 static void
-task_complete(struct reset_task *task, const struct nvme_completion *completion)
+task_complete(struct reset_task *task, const struct spdk_nvme_cpl *completion)
 {
 	struct ns_worker_ctx	*ns_ctx;
 
 	ns_ctx = task->ns_ctx;
 	ns_ctx->current_queue_depth--;
 
-	if (nvme_completion_is_error(completion)) {
+	if (spdk_nvme_cpl_is_error(completion)) {
 		ns_ctx->io_completed_error++;
 	} else {
 		ns_ctx->io_completed++;
@@ -233,7 +238,7 @@ task_complete(struct reset_task *task, const struct nvme_completion *completion)
 }
 
 static void
-io_complete(void *ctx, const struct nvme_completion *completion)
+io_complete(void *ctx, const struct spdk_nvme_cpl *completion)
 {
 	task_complete((struct reset_task *)ctx, completion);
 }
@@ -241,7 +246,7 @@ io_complete(void *ctx, const struct nvme_completion *completion)
 static void
 check_io(struct ns_worker_ctx *ns_ctx)
 {
-	nvme_ctrlr_process_io_completions(ns_ctx->ctr_entry->ctrlr, 0);
+	spdk_nvme_qpair_process_completions(ns_ctx->qpair, 0);
 }
 
 static void
@@ -264,20 +269,21 @@ drain_io(struct ns_worker_ctx *ns_ctx)
 static int
 work_fn(void *arg)
 {
-	uint64_t tsc_end = rte_get_timer_cycles() + g_time_in_sec * g_tsc_rate;
+	uint64_t tsc_end = spdk_get_ticks() + g_time_in_sec * g_tsc_rate;
 	struct worker_thread *worker = (struct worker_thread *)arg;
 	struct ns_worker_ctx *ns_ctx = NULL;
+	bool did_reset = false;
 
 	printf("Starting thread on core %u\n", worker->lcore);
-
-	if (nvme_register_io_thread() != 0) {
-		fprintf(stderr, "nvme_register_io_thread() failed on core %u\n", worker->lcore);
-		return -1;
-	}
 
 	/* Submit initial I/O for each namespace. */
 	ns_ctx = worker->ns_ctx;
 	while (ns_ctx != NULL) {
+		ns_ctx->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_ctx->entry->ctrlr, NULL, 0);
+		if (ns_ctx->qpair == NULL) {
+			fprintf(stderr, "spdk_nvme_ctrlr_alloc_io_qpair() failed on core %u\n", worker->lcore);
+			return -1;
+		}
 		submit_io(ns_ctx, g_queue_depth);
 		ns_ctx = ns_ctx->next;
 	}
@@ -294,19 +300,19 @@ work_fn(void *arg)
 			ns_ctx = ns_ctx->next;
 		}
 
-		if (((tsc_end - rte_get_timer_cycles()) / g_tsc_rate) > (uint64_t)g_time_in_sec / 5 &&
-		    ((tsc_end - rte_get_timer_cycles()) / g_tsc_rate) < (uint64_t)(g_time_in_sec / 5 + 10)) {
+		if (!did_reset && ((tsc_end - spdk_get_ticks()) / g_tsc_rate) > (uint64_t)g_time_in_sec / 2) {
 			ns_ctx = worker->ns_ctx;
 			while (ns_ctx != NULL) {
-				if (nvme_ctrlr_reset(ns_ctx->ctr_entry->ctrlr) < 0) {
+				if (spdk_nvme_ctrlr_reset(ns_ctx->entry->ctrlr) < 0) {
 					fprintf(stderr, "nvme reset failed.\n");
 					return -1;
 				}
 				ns_ctx = ns_ctx->next;
 			}
+			did_reset = true;
 		}
 
-		if (rte_get_timer_cycles() > tsc_end) {
+		if (spdk_get_ticks() > tsc_end) {
 			break;
 		}
 	}
@@ -314,10 +320,9 @@ work_fn(void *arg)
 	ns_ctx = worker->ns_ctx;
 	while (ns_ctx != NULL) {
 		drain_io(ns_ctx);
+		spdk_nvme_ctrlr_free_io_qpair(ns_ctx->qpair);
 		ns_ctx = ns_ctx->next;
 	}
-
-	nvme_unregister_io_thread();
 
 	return 0;
 }
@@ -382,7 +387,7 @@ parse_args(int argc, char **argv)
 	int op;
 	bool mix_specified = false;
 
-	/* default value*/
+	/* default value */
 	g_queue_depth = 0;
 	g_io_size_bytes = 0;
 	workload_type = NULL;
@@ -480,7 +485,6 @@ parse_args(int argc, char **argv)
 		g_is_random = 1;
 	}
 
-	optind = 1;
 	return 0;
 }
 
@@ -503,55 +507,32 @@ register_workers(void)
 	return 0;
 }
 
+
+static bool
+probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	 struct spdk_nvme_ctrlr_opts *opts)
+{
+	return true;
+}
+
+static void
+attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+{
+	register_ctrlr(ctrlr);
+}
+
 static int
 register_controllers(void)
 {
-	struct pci_device_iterator	*pci_dev_iter;
-	struct pci_device		*pci_dev;
-	struct pci_id_match		match;
-	int				rc;
-
 	printf("Initializing NVMe Controllers\n");
 
-	pci_system_init();
-
-	match.vendor_id =	PCI_MATCH_ANY;
-	match.subvendor_id =	PCI_MATCH_ANY;
-	match.subdevice_id =	PCI_MATCH_ANY;
-	match.device_id =	PCI_MATCH_ANY;
-	match.device_class =	NVME_CLASS_CODE;
-	match.device_class_mask = 0xFFFFFF;
-
-	pci_dev_iter = pci_id_match_iterator_create(&match);
-
-	rc = 0;
-	while ((pci_dev = pci_device_next(pci_dev_iter))) {
-		struct nvme_controller *ctrlr;
-
-		if (pci_device_has_non_uio_driver(pci_dev)) {
-			fprintf(stderr, "non-uio kernel driver attached to nvme\n");
-			fprintf(stderr, " controller at pci bdf %d:%d:%d\n",
-				pci_dev->bus, pci_dev->dev, pci_dev->func);
-			fprintf(stderr, " skipping...\n");
-			continue;
-		}
-
-		pci_device_probe(pci_dev);
-
-		ctrlr = nvme_attach(pci_dev);
-		if (ctrlr == NULL) {
-			fprintf(stderr, "nvme_attach failed for controller at pci bdf %d:%d:%d\n",
-				pci_dev->bus, pci_dev->dev, pci_dev->func);
-			rc = 1;
-			continue;
-		}
-
-		register_ctrlr(ctrlr);
+	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
+		fprintf(stderr, "spdk_nvme_probe() failed\n");
+		return 1;
 	}
 
-	pci_iterator_destroy(pci_dev_iter);
-
-	return rc;
+	return 0;
 }
 
 static void
@@ -561,7 +542,7 @@ unregister_controllers(void)
 
 	while (entry) {
 		struct ctrlr_entry *next = entry->next;
-		nvme_detach(entry->ctrlr);
+		spdk_nvme_detach(entry->ctrlr);
 		free(entry);
 		entry = next;
 	}
@@ -571,7 +552,6 @@ static int
 associate_workers_with_ns(void)
 {
 	struct ns_entry		*entry = g_namespaces;
-	struct ctrlr_entry	*controller_entry = g_controllers;
 	struct worker_thread	*worker = g_workers;
 	struct ns_worker_ctx	*ns_ctx;
 	int			i, count;
@@ -590,13 +570,11 @@ associate_workers_with_ns(void)
 
 		printf("Associating %s with lcore %d\n", entry->name, worker->lcore);
 		ns_ctx->entry = entry;
-		ns_ctx->ctr_entry = controller_entry;
 		ns_ctx->next = worker->ns_ctx;
 		worker->ns_ctx = ns_ctx;
 
 		worker = g_workers;
 
-		controller_entry = controller_entry->next;
 		entry = entry->next;
 		if (entry == NULL) {
 			entry = g_namespaces;
@@ -612,7 +590,7 @@ run_nvme_reset_cycle(int retry_count)
 	struct worker_thread *worker;
 	struct ns_worker_ctx *ns_ctx;
 
-	nvme_retry_count = retry_count;
+	spdk_nvme_retry_count = retry_count;
 
 	if (work_fn(g_workers) != 0) {
 		return -1;
@@ -635,45 +613,29 @@ run_nvme_reset_cycle(int retry_count)
 	return 0;
 }
 
-static char *ealargs[] = {
-	"reset",
-	"-c 0x1",
-	"-n 4",
-};
-
 int main(int argc, char **argv)
 {
-	int rc;
-	int i;
+	int 			rc;
+	int 			i;
+	struct spdk_env_opts	opts;
+
 
 	rc = parse_args(argc, argv);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = rte_eal_init(sizeof(ealargs) / sizeof(ealargs[0]), ealargs);
-
-	if (rc < 0) {
-		fprintf(stderr, "could not initialize dpdk\n");
-		return 1;
-	}
-
-	request_mempool = rte_mempool_create("nvme_request", 8192,
-					     nvme_request_size(), 128, 0,
-					     NULL, NULL, NULL, NULL,
-					     SOCKET_ID_ANY, 0);
-
-	if (request_mempool == NULL) {
-		fprintf(stderr, "could not initialize request mempool\n");
-		return 1;
-	}
+	spdk_env_opts_init(&opts);
+	opts.name = "reset";
+	opts.core_mask = "0x1";
+	spdk_env_init(&opts);
 
 	task_pool = rte_mempool_create("task_pool", 8192,
 				       sizeof(struct reset_task),
 				       64, 0, NULL, NULL, task_ctor, NULL,
 				       SOCKET_ID_ANY, 0);
 
-	g_tsc_rate = rte_get_timer_hz();
+	g_tsc_rate = spdk_get_ticks_hz();
 
 	if (register_workers() != 0) {
 		return 1;
